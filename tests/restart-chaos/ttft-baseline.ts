@@ -296,7 +296,27 @@ async function main() {
   // One shutdown path for normal completion and for SIGINT/SIGTERM: the server
   // runs in a detached process group and the embedded Postgres has no exit hook.
   let stopping: Promise<void> | null = null;
-  const shutdown = () => (stopping ??= supervisor.stop().catch(error => {
+  // Daytona resources are released while the server still runs, before it stops;
+  // the same path serves normal completion and SIGINT/SIGTERM.
+  const releaseDaytona = async () => {
+    if (!sweeper) return;
+    const owned = sweeper as DaytonaWaveSweeper;
+    sweeper = null;
+    try {
+      const cleanup = await owned.cleanUp();
+      timeline.add("daytona_cleanup", cleanup);
+      await writeFile(path.join(outDir, "sandbox-cleanup.json"), `${JSON.stringify(cleanup, null, 2)}\n`, { mode: 0o600 });
+      if (cleanup.remainingSandboxes.length || cleanup.errors.length || cleanup.environmentDeleteBlocked || !cleanup.environmentDeleted) {
+        process.stderr.write(`Daytona cleanup incomplete: remaining ${cleanup.remainingSandboxes.join(", ") || "none"}; `
+          + `environment deleted ${cleanup.environmentDeleted}${cleanup.environmentDeleteBlocked ? ` (blocked: ${String(cleanup.environmentDeleteBlocked)})` : ""}; ${cleanup.errors.join("; ")}\n`);
+        process.exitCode = 1;
+      }
+    } catch (error) {
+      timeline.add("daytona_cleanup_failed", { error: String(error) });
+      process.exitCode = 1;
+    }
+  };
+  const shutdown = () => (stopping ??= releaseDaytona().then(() => supervisor.stop()).catch(error => {
     process.stderr.write(`supervisor stop: ${String(error)}\n`);
   }));
   const onSignal = (signal: NodeJS.Signals) => {
@@ -366,7 +386,10 @@ async function main() {
         await api.post(`/api/issues/${entry.issueId}/comments`, { body: warmFollowUp(`${entry.nonce}-postfault`), reopen: true });
         const after = await waitForRest(api, supervisor, entry.issueId, entry.runs + 1);
         for (const run of after.runs) if (!runPhase.has(runIdOf(run))) runPhase.set(runIdOf(run), "postfault");
-        if (after.timedOut) timeline.add("baseline_sample_timeout", { adapter, issueId: entry.issueId, phase: "postfault" });
+        if (after.timedOut) {
+          timedOutIssues.add(entry.issueId);
+          timeline.add("baseline_sample_timeout", { adapter, issueId: entry.issueId, phase: "postfault" });
+        }
         else timeline.add("baseline_postfault_done", { adapter, issueId: entry.issueId });
       }));
     }
@@ -463,7 +486,12 @@ async function main() {
         runs.push({ runId, adapter: task.adapter, environment: env,
           phase: runPhase.get(runId) ?? task.phase, events: await allEvents(api, runId) });
         // Workspace commands (worktree, provision, sync) the run waited on, with their durations.
-        const operations = await api.get<Json[]>(`/api/heartbeat-runs/${runId}/workspace-operations`, 10_000).catch(() => []);
+        const operations = await api.get<Json[]>(`/api/heartbeat-runs/${runId}/workspace-operations`, 10_000).catch((error: unknown) => {
+          // A failed read is recorded as such, never as "no workspace operations".
+          workspaceOperations.push({ runId, adapter: task.adapter, phase: runPhase.get(runId) ?? task.phase,
+            operation: "read_failed", status: error instanceof Error ? error.message.slice(0, 160) : String(error), durationMs: null, command: null });
+          return [] as Json[];
+        });
         for (const operation of operations) workspaceOperations.push({ runId, adapter: task.adapter,
           phase: runPhase.get(runId) ?? task.phase, operation: String(operation.phase), status: String(operation.status),
           durationMs: operation.startedAt && operation.finishedAt
@@ -493,22 +521,8 @@ async function main() {
     if (wrongReplies.length) process.exitCode = 1;
     process.stdout.write(`\nWrote ${outDir}\n`);
   } finally {
-    // Every Daytona sandbox this run created is archived or destroyed before the server stops.
-    if (sweeper) {
-      try {
-        const cleanup = await (sweeper as DaytonaWaveSweeper).cleanUp();
-        timeline.add("daytona_cleanup", cleanup);
-        await writeFile(path.join(outDir, "sandbox-cleanup.json"), `${JSON.stringify(cleanup, null, 2)}\n`, { mode: 0o600 });
-        if (cleanup.remainingSandboxes.length || cleanup.errors.length) {
-          process.stderr.write(`Daytona cleanup incomplete: remaining ${cleanup.remainingSandboxes.join(", ") || "none"}; ${cleanup.errors.join("; ")}\n`);
-          process.exitCode = 1;
-        }
-      } catch (error) {
-        timeline.add("daytona_cleanup_failed", { error: String(error) });
-        process.exitCode = 1;
-      }
-    }
-    // Always stop the wrapper-owned embedded Postgres (SysV shared memory is scarce).
+    // Every Daytona sandbox this run created is archived or destroyed before the server
+    // stops, then the wrapper-owned embedded Postgres stops (SysV shared memory is scarce).
     await shutdown();
     process.off("SIGINT", onSignal);
     process.off("SIGTERM", onSignal);

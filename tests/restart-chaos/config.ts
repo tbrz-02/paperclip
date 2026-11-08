@@ -155,7 +155,13 @@ export function parseCommand(argv: readonly string[], now = Date.now()): ParsedC
   if (env !== "daytona" && values["daytona-cpu"] !== undefined) throw new Error("--daytona-cpu applies only to --env daytona");
   if (options.daytonaCpu !== undefined) {
     const budget = integer(process.env.RESTART_CHAOS_DAYTONA_VCPU_BUDGET, "RESTART_CHAOS_DAYTONA_VCPU_BUDGET", DAYTONA_VCPU_BUDGET, 1, 1_000);
-    if (options.concurrency * options.daytonaCpu > budget) {
+    // A warm sandbox outlives its task for the idle window, and a new task cannot reuse
+    // another task's sandbox, so with --daytona-warm every task can hold one at once.
+    const holders = options.daytonaWarm ? Math.max(options.concurrency, options.tasks) : options.concurrency;
+    if (holders * options.daytonaCpu > budget) {
+      if (options.daytonaWarm) throw new Error(`--daytona-warm keeps each task's sandbox for the idle window: ${holders} tasks × `
+        + `--daytona-cpu ${options.daytonaCpu} vCPU exceeds the Daytona vCPU budget of ${budget}. Lower --tasks or --daytona-cpu `
+        + "(RESTART_CHAOS_DAYTONA_VCPU_BUDGET sets the budget).");
       throw new Error(`--concurrency ${options.concurrency} × --daytona-cpu ${options.daytonaCpu} vCPU exceeds the Daytona vCPU budget of ${budget} `
         + "for chaos tasks. Lower one of them (RESTART_CHAOS_DAYTONA_VCPU_BUDGET sets the budget).");
     }
