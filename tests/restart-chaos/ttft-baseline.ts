@@ -20,7 +20,7 @@ import path from "node:path";
 import { parseArgs } from "node:util";
 import { setTimeout as delay } from "node:timers/promises";
 import { ChaosApi } from "./api.js";
-import { CREDENTIAL_FOR_ADAPTER } from "./config.js";
+import { CREDENTIAL_FOR_ADAPTER, DAYTONA_VCPU_BUDGET } from "./config.js";
 import { ACTIVE_RUN_STATUSES } from "./grader.js";
 import { chaosLifecycleOverrides, seedChaosLab, type ChaosLab } from "./seed.js";
 import { ChaosSupervisor } from "./supervisor.js";
@@ -261,6 +261,19 @@ async function main() {
   const restarts = Math.max(0, Number(values.restarts));
   const env = values.env === "daytona" ? "daytona" as const : "local" as const;
   if (env === "daytona" && !values["daytona-image"]) throw new Error("--env daytona needs --daytona-image");
+  if (env === "daytona") {
+    // A warm sandbox (the warm fixture, or the inheriting default) outlives its task for
+    // the idle window and no other task reuses it, so count one per sampled task.
+    const budget = Number(process.env.RESTART_CHAOS_DAYTONA_VCPU_BUDGET ?? DAYTONA_VCPU_BUDGET);
+    const perTaskPhases = ["coldwarm", "midturn", "verify"].filter(phase => phases.has(phase)).length
+      + (phases.has("restart") ? Math.max(1, Number(values.restarts)) : 0);
+    const cpu = Number(values["daytona-cpu"]);
+    const holders = requested.length * Math.max(1, Number(values.samples)) * Math.max(1, perTaskPhases);
+    if (holders * cpu > budget) {
+      throw new Error(`${holders} sampled tasks × --daytona-cpu ${cpu} vCPU can be held at once (warm sandboxes outlive their task), `
+        + `exceeding the Daytona vCPU budget of ${budget}. Lower --samples, --adapters or --daytona-cpu (RESTART_CHAOS_DAYTONA_VCPU_BUDGET sets the budget).`);
+    }
+  }
   const missing = [...requested.map(adapter => CREDENTIAL_FOR_ADAPTER[adapter]), ...(env === "daytona" ? ["DAYTONA_API_KEY"] : [])]
     .filter(key => !process.env[key]);
   if (missing.length) throw new Error(`Missing ${missing.join(", ")}; run: set -a; source ~/.secrets; set +a`);
@@ -379,7 +392,13 @@ async function main() {
 
     // First turn after an idle control-plane restart: K1 while nothing runs,
     // then one more follow-up on each task the cold/warm phase left at rest.
-    if (phases.has("postfault") && followUpTasks.size) {
+    // The fault must be idle: no timed-out sample may still be running.
+    const allAtRest = timedOutIssues.size === 0 && (await Promise.all(tasks.map(async task =>
+      (await runsFor(api, task.issueId)).every(run => !ACTIVE_RUN_STATUSES.has(String(run.status)))))).every(Boolean);
+    if (phases.has("postfault") && followUpTasks.size && !allAtRest) {
+      timeline.add("baseline_postfault_skipped", { reason: "work_not_at_rest", timedOut: timedOutIssues.size });
+    }
+    if (phases.has("postfault") && followUpTasks.size && allAtRest) {
       const receipt = await supervisor.fault("K1", 0, "ttft-baseline-postfault");
       faults.push({ kind: "K1", readyAt: receipt.readyAt ?? Date.now(), runIds: [] });
       await Promise.all([...followUpTasks.entries()].map(async ([adapter, entry]) => {
